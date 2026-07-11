@@ -1,0 +1,29 @@
+# PyTorch — pin the cuXXX index to match the base image's CUDA version
+# (see FROM line in e2e.Dockerfile). Uses --extra-index-url so packages
+# without CUDA builds (av2, s5cmd, etc.) still resolve from PyPI.
+--extra-index-url https://download.pytorch.org/whl/cu126
+
+torch
+torchvision
+torchaudio
+
+# av2-api — installed from PyPI as a prebuilt wheel. Do NOT install via
+# `pip install git+https://github.com/argoverse/av2-api`: that path builds
+# the Rust/pyo3 extension from source and requires a Rust nightly toolchain,
+# a common source of build failures in containers.
+av2
+
+# s5cmd — fast parallel S3 transfer for pulling datasets/checkpoints from AWS.
+# This PyPI package bundles the official Go binary as a wheel, so no Go
+# toolchain or manual binary download is needed.
+s5cmd
+
+# Training/eval extras (av2 already pulls in numpy, pandas, pyarrow,
+# matplotlib as its own dependencies).
+scipy
+tqdm
+einops
+tensorboard
+dill
+tyro
+viser
