@@ -1,37 +1,43 @@
-"""Filter raw AV2 motion-forecasting scenarios down to a small, "interesting" subset.
+"""Filter raw AV2 motion-forecasting scenarios down to a small, "interesting",
+strictly vehicle-to-vehicle subset.
 
-Ranks each scenario by two signals and combines them:
+Scope is vehicle-only: the focal (ego) track must itself be of object_type
+"vehicle", and any scenario containing a pedestrian, cyclist, or
+motorcyclist ANYWHERE (not just near the ego) is dropped entirely. Only
+vehicle/bus agents count toward the interaction signal. This is a strict
+filter (not just "ignore them for scoring") so filtered_data never contains
+pedestrian/cyclist/motorcyclist dynamics at all.
+
+Ranks each surviving scenario by two signals and combines them:
   - curvature_score:   total heading change (turning angle, radians) of the
                         focal track. High = the ego takes a real turn/lane
                         change rather than driving straight.
-  - interaction_score: average number of other dynamic agents (vehicle, bus,
-                        pedestrian, cyclist, motorcyclist) within
+  - interaction_score: average number of other vehicles/buses within
                         --interaction-radius meters of the focal track per
                         timestep. High = the ego's future is plausibly
                         influenced by nearby traffic (following, yielding,
                         merging, crossing), not driving in isolation.
+Both are percentile-ranked within the pool and combined with
+--curvature-weight / --interaction-weight (default 0.5/0.5).
 
-Both scores are percentile-ranked within the split and combined with
---curvature-weight / --interaction-weight (default 0.5/0.5), then the top-K
-scenarios by combined score are copied into `filtered_data/`.
+Split provenance:
+  - filtered_data/train (--n-train) and filtered_data/val (--n-val) are both
+    carved from the raw AV2 `train` split (disjoint, score-interleaved), since
+    that pool is large enough to hold both after the strict vehicle-only filter.
+  - filtered_data/test (--n-test) is carved from the raw AV2 `val` split (which
+    has full labeled futures, unlike AV2's official masked test split). Pass
+    --n-test -1 (the default) to keep every scenario that survives the filter
+    there, since that pool is small.
 
-AV2's official `test` split has its future masked (only scored via
-Argoverse's hidden leaderboard), so it can't be used for local minADE/minFDE
-evaluation. Instead, the raw `val` split (which has full labeled future) is
-ranked once and partitioned into two disjoint local subsets:
-  - filtered_data/val   (--n-val)          - used for training-time checks
-  - filtered_data/test  (--n-holdout-test) - held out, only for final eval
-The partition interleaves by combined-score rank so both subsets have a
-similar score distribution rather than test getting all the "leftover" tail.
-
-The raw AV2 `test` split is skipped by default (--n-official-test 0); pass a
-positive value only if you're prepping a real leaderboard submission (output
+AV2's official `test` split is skipped by default (--n-official-test 0) since
+its future is masked and only scorable via Argoverse's hidden leaderboard;
+pass a positive value only if prepping a real leaderboard submission (output
 goes to filtered_data/official_test to avoid confusion with the local test
 set above).
 
 Usage:
     python filtering.py
-    python filtering.py --n-train 12000 --n-val 4000 --n-holdout-test 4000 --overwrite
+    python filtering.py --n-train 12000 --n-val 8000 --n-test -1 --overwrite
 """
 
 import argparse
@@ -45,11 +51,13 @@ from tqdm import tqdm
 
 DEFAULT_DATA_ROOT = Path("/workspace/workspace/data/av2")
 DEFAULT_OUTPUT_ROOT = Path("/workspace/workspace/filtered_data")
-DYNAMIC_TYPES = {"vehicle", "bus", "pedestrian", "cyclist", "motorcyclist"}
+VEHICLE_LIKE_TYPES = {"vehicle", "bus"}
+VRU_TYPES = {"pedestrian", "cyclist", "motorcyclist"}
 
 
 def scenario_features(scenario_dir: Path, min_timesteps: int, interaction_radius: float):
-    """Return a dict of per-scenario features, or None if the scenario is unusable."""
+    """Return a dict of per-scenario features, or None if the scenario is unusable
+    or contains a pedestrian/cyclist/motorcyclist anywhere in the scene."""
     scenario_id = scenario_dir.name
     parquet_path = scenario_dir / f"scenario_{scenario_id}.parquet"
     if not parquet_path.exists():
@@ -71,13 +79,17 @@ def scenario_features(scenario_dir: Path, min_timesteps: int, interaction_radius
     focal = df[df["track_id"] == focal_id].sort_values("timestep")
     if len(focal) < min_timesteps:
         return None
+    if focal["object_type"].iloc[0] != "vehicle":
+        return None
+    if df["object_type"].isin(VRU_TYPES).any():
+        return None
 
     heading = focal["heading"].to_numpy()
     diffs = np.diff(heading)
     diffs = (diffs + np.pi) % (2 * np.pi) - np.pi  # wrap to [-pi, pi]
     curvature_score = float(np.abs(diffs).sum())
 
-    others = df[(df["track_id"] != focal_id) & (df["object_type"].isin(DYNAMIC_TYPES))]
+    others = df[(df["track_id"] != focal_id) & (df["object_type"].isin(VEHICLE_LIKE_TYPES))]
     merged = others.merge(
         focal[["timestep", "position_x", "position_y"]],
         on="timestep",
@@ -187,8 +199,86 @@ def export_scenarios(
     )
 
 
-def run_simple_split(
-    split: str,
+def run_train_val_split(
+    n_train: int,
+    n_val: int,
+    data_root: Path,
+    output_root: Path,
+    min_timesteps: int,
+    interaction_radius: float,
+    curvature_weight: float,
+    interaction_weight: float,
+    workers: int,
+    link: bool,
+    overwrite: bool,
+):
+    """train and val are both carved (disjoint, score-interleaved) from the raw
+    AV2 `train` split, since it's the only pool large enough to hold both after
+    the strict vehicle-only / no-VRU filter."""
+    if n_train <= 0 and n_val <= 0:
+        print("skip train/val: both n_train and n_val are 0")
+        return
+
+    split_dir = data_root / "train"
+    if not split_dir.exists():
+        print(f"skip train/val: {split_dir} does not exist")
+        return
+
+    ranked = rank_split(split_dir, min_timesteps, interaction_radius, workers)
+    if ranked.empty:
+        print("skip train/val: no usable scenarios found")
+        return
+    if len(ranked) < n_train + n_val:
+        print(
+            f"warning: only {len(ranked)} scenarios survived the filter, "
+            f"fewer than requested n_train+n_val={n_train + n_val}"
+        )
+
+    ranked = add_combined_score(ranked, curvature_weight, interaction_weight)
+    train_subset, val_subset = interleave_split(ranked, n_train, n_val)
+
+    if n_train > 0:
+        export_scenarios(train_subset, split_dir, output_root / "train", "train_manifest.csv", link, overwrite)
+    if n_val > 0:
+        export_scenarios(val_subset, split_dir, output_root / "val", "val_manifest.csv", link, overwrite)
+
+
+def run_test_split(
+    n_test: int,
+    data_root: Path,
+    output_root: Path,
+    min_timesteps: int,
+    interaction_radius: float,
+    curvature_weight: float,
+    interaction_weight: float,
+    workers: int,
+    link: bool,
+    overwrite: bool,
+):
+    """test is carved from the raw AV2 `val` split (full labeled futures), kept
+    disjoint from train/val since it comes from an entirely different raw pool.
+    n_test <= 0 means "keep every scenario that survives the filter" (that pool
+    is small after the strict no-VRU filter, so there's usually nothing to trim)."""
+    if n_test == 0:
+        print("skip test: n_test=0")
+        return
+
+    split_dir = data_root / "val"
+    if not split_dir.exists():
+        print(f"skip test: {split_dir} does not exist")
+        return
+
+    ranked = rank_split(split_dir, min_timesteps, interaction_radius, workers)
+    if ranked.empty:
+        print("skip test: no usable scenarios found")
+        return
+
+    ranked = add_combined_score(ranked, curvature_weight, interaction_weight)
+    selected = ranked if n_test < 0 else ranked.head(n_test)
+    export_scenarios(selected, split_dir, output_root / "test", "test_manifest.csv", link, overwrite)
+
+
+def run_official_test(
     n_select: int,
     data_root: Path,
     output_root: Path,
@@ -199,71 +289,24 @@ def run_simple_split(
     workers: int,
     link: bool,
     overwrite: bool,
-    out_name: str = None,
 ):
     if n_select <= 0:
-        print(f"skip {split}: n_select=0")
+        print("skip official_test: n_official_test=0")
         return
 
-    split_dir = data_root / split
+    split_dir = data_root / "test"
     if not split_dir.exists():
-        print(f"skip {split}: {split_dir} does not exist")
+        print(f"skip official_test: {split_dir} does not exist")
         return
 
     ranked = rank_split(split_dir, min_timesteps, interaction_radius, workers)
     if ranked.empty:
-        print(f"skip {split}: no usable scenarios found")
+        print("skip official_test: no usable scenarios found")
         return
 
     ranked = add_combined_score(ranked, curvature_weight, interaction_weight)
     selected = ranked.head(n_select)
-    out_name = out_name or split
-    export_scenarios(
-        selected,
-        split_dir,
-        output_root / out_name,
-        f"{out_name}_manifest.csv",
-        link,
-        overwrite,
-    )
-
-
-def run_val_test_split(
-    n_val: int,
-    n_holdout_test: int,
-    data_root: Path,
-    output_root: Path,
-    min_timesteps: int,
-    interaction_radius: float,
-    curvature_weight: float,
-    interaction_weight: float,
-    workers: int,
-    link: bool,
-    overwrite: bool,
-):
-    if n_val <= 0 and n_holdout_test <= 0:
-        print("skip val/test: both n_val and n_holdout_test are 0")
-        return
-
-    split_dir = data_root / "val"
-    if not split_dir.exists():
-        print(f"skip val/test: {split_dir} does not exist")
-        return
-
-    ranked = rank_split(split_dir, min_timesteps, interaction_radius, workers)
-    if ranked.empty:
-        print("skip val/test: no usable scenarios found")
-        return
-
-    ranked = add_combined_score(ranked, curvature_weight, interaction_weight)
-    val_subset, test_subset = interleave_split(ranked, n_val, n_holdout_test)
-
-    if n_val > 0:
-        export_scenarios(val_subset, split_dir, output_root / "val", "val_manifest.csv", link, overwrite)
-    if n_holdout_test > 0:
-        export_scenarios(
-            test_subset, split_dir, output_root / "test", "test_manifest.csv", link, overwrite
-        )
+    export_scenarios(selected, split_dir, output_root / "official_test", "official_test_manifest.csv", link, overwrite)
 
 
 def main():
@@ -273,12 +316,12 @@ def main():
     parser.add_argument("--data-root", type=Path, default=DEFAULT_DATA_ROOT)
     parser.add_argument("--output-root", type=Path, default=DEFAULT_OUTPUT_ROOT)
     parser.add_argument("--n-train", type=int, default=12000)
-    parser.add_argument("--n-val", type=int, default=4000)
+    parser.add_argument("--n-val", type=int, default=8000)
     parser.add_argument(
-        "--n-holdout-test",
+        "--n-test",
         type=int,
-        default=4000,
-        help="local held-out test set, drawn from the raw AV2 val split (disjoint from --n-val)",
+        default=-1,
+        help="scenarios to keep from the raw AV2 val split; -1 = keep all that survive the filter",
     )
     parser.add_argument(
         "--n-official-test",
@@ -303,23 +346,9 @@ def main():
     )
     args = parser.parse_args()
 
-    run_simple_split(
-        split="train",
-        n_select=args.n_train,
-        data_root=args.data_root,
-        output_root=args.output_root,
-        min_timesteps=args.min_timesteps,
-        interaction_radius=args.interaction_radius,
-        curvature_weight=args.curvature_weight,
-        interaction_weight=args.interaction_weight,
-        workers=args.workers,
-        link=args.link,
-        overwrite=args.overwrite,
-    )
-
-    run_val_test_split(
+    run_train_val_split(
+        n_train=args.n_train,
         n_val=args.n_val,
-        n_holdout_test=args.n_holdout_test,
         data_root=args.data_root,
         output_root=args.output_root,
         min_timesteps=args.min_timesteps,
@@ -331,8 +360,20 @@ def main():
         overwrite=args.overwrite,
     )
 
-    run_simple_split(
-        split="test",
+    run_test_split(
+        n_test=args.n_test,
+        data_root=args.data_root,
+        output_root=args.output_root,
+        min_timesteps=args.min_timesteps,
+        interaction_radius=args.interaction_radius,
+        curvature_weight=args.curvature_weight,
+        interaction_weight=args.interaction_weight,
+        workers=args.workers,
+        link=args.link,
+        overwrite=args.overwrite,
+    )
+
+    run_official_test(
         n_select=args.n_official_test,
         data_root=args.data_root,
         output_root=args.output_root,
@@ -343,7 +384,6 @@ def main():
         workers=args.workers,
         link=args.link,
         overwrite=args.overwrite,
-        out_name="official_test",
     )
 
 

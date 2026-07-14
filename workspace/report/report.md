@@ -40,19 +40,54 @@ Both are percentile-ranked within the split and combined 50/50 into a
 ships with the future masked (only scorable via Argoverse's hidden
 leaderboard) — no local ground truth, so it's useless for computing
 minADE/minFDE ourselves. Instead, the raw `val` split (which has full labeled
-futures) is ranked once and partitioned into two disjoint local subsets —
-`filtered_data/val` and `filtered_data/test` — interleaved by score so both
-have a similar difficulty distribution rather than one getting the leftover
-tail. `test` here means "our own held-out set," not AV2's.
+futures) is used for our own local val/test, since we have ground truth for
+it. `test` here means "our own held-out set," not AV2's.
 
-**Current subset sizes** (`filtered_data/{train,val,test}` + matching
-`*_manifest.csv` with per-scenario scores):
+### 3. Restricted scope to vehicle-to-vehicle only (single agent-type)
+Initially the interaction signal counted any dynamic agent (vehicle, bus,
+pedestrian, cyclist, motorcyclist) near the ego. We narrowed this to
+**vehicle-only, strictly**: the focal (ego) track must itself be of type
+`vehicle`, and any scenario containing a pedestrian/cyclist/motorcyclist
+*anywhere in the scene* (not just near the ego) is dropped entirely. Only
+vehicle/bus agents count toward `interaction_score`.
+
+**Why:** this is a first diffusion-model project, and the goal is to validate
+the pipeline (data → model → training → eval) with overfitting-is-fine
+scope. Pedestrians and cyclists have qualitatively different motion dynamics
+than vehicles — low speed, frequent stop/start, sharp direction changes,
+sidewalk-constrained rather than lane-constrained. Mixing agent types into
+one model means the network has to learn two very different motion
+distributions simultaneously, which adds a confound: if training goes
+poorly, it's unclear whether the diffusion setup itself is wrong or whether
+it's struggling specifically with heterogeneous agent behavior. Confining
+training to a single agent-type (vehicle-to-vehicle interaction only)
+removes that confound — every future trajectory in the dataset, ego and
+neighbors alike, follows roughly the same lane-constrained driving dynamics,
+so if the model fails to learn, the problem is isolated to the diffusion
+pipeline itself, not agent-type diversity. Multi-agent-type modeling can be
+revisited later once the core pipeline is confirmed to work.
+
+**Feasibility check performed first** (see [filtering.py](../filtering.py)):
+scanning the full raw AV2 train (~199,908) and val (~24,988) splits found
+176,740 / 22,134 scenarios with a vehicle focal track, and — under the
+stricter "zero pedestrian/cyclist/motorcyclist anywhere in the scene"
+constraint — 36,940 (train) / 4,538 (val) scenarios survive. That's enough
+headroom in the raw train pool to source both our train and val subsets from
+it, while reserving the entire raw val pool as a genuinely separate,
+untouched-by-selection test set.
+
+**Current subset sizes and provenance** (`filtered_data/{train,val,test}` +
+matching `*_manifest.csv` with per-scenario scores):
 
 | split | scenarios | source |
 |---|---|---|
-| train | 12,000 | top combined_score from raw AV2 train |
-| val   | 4,000  | score-interleaved half of raw AV2 val |
-| test  | 4,000  | score-interleaved other half of raw AV2 val |
+| train | 12,000 | score-interleaved subset of raw AV2 `train` (vehicle-only, no-VRU pool of 36,940) |
+| val   | 8,000  | disjoint score-interleaved remainder of the same raw AV2 `train` pool |
+| test  | 4,538 (all survivors) | entire raw AV2 `val` pool (vehicle-only, no-VRU), kept as a wholly separate held-out set |
+
+train/val being drawn from the same raw AV2 split is fine here since AV2
+scenarios are independent driving logs, not sequential — the score-interleaved
+split still keeps them disjoint (no scenario appears in both).
 
 ## TODO (next steps, with reasoning)
 
