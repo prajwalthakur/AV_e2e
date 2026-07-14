@@ -1,7 +1,8 @@
 # keep the data/ folder in git, but not its (downloaded) contents
 workspace/data/*
+workspace/filtered_data/*
 !workspace/data/.gitkeep
-
+!workspace/filtered_data/.gitkeep
 
 # Prerequisites
 *.d

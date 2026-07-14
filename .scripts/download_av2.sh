@@ -17,9 +17,10 @@ for split in train val test; do
 done
 
 echo "==> syncing top-level annotation files"
-s5cmd --no-sign-request cp -n \
-    "s3://argoverse/datasets/av2/$DATASET_NAME/av2_mf_focal_test_annotations.parquet" \
-    "s3://argoverse/datasets/av2/$DATASET_NAME/av2_mf_multi_test_annotations.parquet" \
-    "$TARGET_DIR/"
+for f in av2_mf_focal_test_annotations.parquet av2_mf_multi_test_annotations.parquet; do
+    s5cmd --no-sign-request cp -n \
+        "s3://argoverse/datasets/av2/$DATASET_NAME/$f" \
+        "$TARGET_DIR/$f"
+done
 
 echo "==> done"
